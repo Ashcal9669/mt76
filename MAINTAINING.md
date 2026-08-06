@@ -104,3 +104,32 @@ Zero errors, zero warnings. If the compiler starts warning on code you just touc
 ## About the compat-patches/ folder
 
 Don't let the name fool you. Nothing in the build applies those. There's no step in the Makefile or the install script that runs patch against them. The one file in there is a record, it writes down the inline compat edits that went into the eeprom files for the 6.6 header rename so there's a trail. The real compat work lives in the code as guards, not as patch files in that folder.
+
+## Intentional downstream differences
+
+This tree contains deliberate differences from upstream behavior.
+
+These differences are kept intentionally and should not be removed during
+rebases or cherry-picks without checking the reason they exist.
+
+### mt792x monitor handling
+
+The mt792x monitor handling in this tree intentionally differs from the
+upstream virtual monitor approach.
+
+The change is implemented in the common mt792x code path and applies to
+mt7921, mt7922, and mt7925.
+
+This behavior preserves active monitor handling in this tree rather than
+following the upstream virtual monitor approach.
+
+When rebasing or cherry-picking upstream commits touching monitor handling,
+verify that the change preserves this behavior before accepting it.
+
+### NAPI revert
+
+The NAPI revert from #72 is also an intentional difference.
+
+If a future upstream change makes this revert unnecessary, this section can
+be updated. Until then, treat it as a deliberate maintenance choice rather
+than an accidental missing upstream commit.
