@@ -1486,14 +1486,15 @@ static int mt7925_mac_link_sta_add(struct mt76_dev *mdev,
 	} else if (ieee80211_vif_is_mld(vif) &&
 		   link_sta != mlink->pri_link) {
 		struct mt792x_link_sta *pri_mlink;
-		struct mt76_wcid *pri_wcid;
 
-		/* alternative lookup via def_wcid */
-		pri_wcid = mlink->wcid.def_wcid;
-
-		pri_mlink = pri_wcid ?
-			    container_of(pri_wcid, struct mt792x_link_sta, wcid) :
-			    NULL;
+		/* deflink_id is the authoritative primary-link source of
+		 * truth (can be promoted away from the original def_wcid
+		 * embedded-storage link by failover -- see
+		 * mt7925_mac_sta_remove_links()). def_wcid itself is a fixed
+		 * address set once at link-add time and does not follow
+		 * promotion, so it must not be used to find "the primary."
+		 */
+		pri_mlink = mt792x_sta_to_link(msta, msta->deflink_id);
 
 		if (WARN_ON_ONCE(!pri_mlink)) {
 			ret = -EINVAL;
@@ -1503,7 +1504,7 @@ static int mt7925_mac_link_sta_add(struct mt76_dev *mdev,
 		if (READ_ONCE(mt76_mlo_diag_trace))
 			printk(KERN_INFO
 			      "MLO_STA_REC_PRIMARY_RETOUCH: adding_link=%u pri_wcid=%u pri_link_id=%u state=ASSOC\n",
-			      link_id, pri_wcid->idx, pri_wcid->link_id);
+			      link_id, pri_mlink->wcid.idx, pri_mlink->wcid.link_id);
 
 		ret = mt7925_mcu_sta_update(dev, mlink->pri_link, vif,
 					    pri_mlink, true,
