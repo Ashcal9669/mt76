@@ -130,6 +130,42 @@ struct mt792x_sta {
 
 	u16 valid_links;
 	u8 deflink_id;
+
+	/* Backup link for deflink promotion on failover -- mirrors mt7996's
+	 * seclink_id (mt7996/main.c:1160-1252). Kept pointing at a genuine
+	 * alternate valid link whenever one exists; equals deflink_id when
+	 * no backup is currently available.
+	 */
+	u8 seclink_id;
+
+	/* Round-robin cursor for mt792x_sta_to_link()'s MLO TX link
+	 * selection: which active link this STA's next
+	 * IEEE80211_LINK_UNSPECIFIED-tagged packet should go to. Only ever
+	 * touched from that one call site.
+	 */
+	u8 mlo_tx_link_cursor;
+
+	/* TID->link pinning for the MLO bulk-TX scheduler
+	 * (mt7925_mlo_force_bulk_wcid(), mt792x_core.c). A TID's BA session
+	 * has one shared sequence-number space (mt76_txq.agg_ssn) but each
+	 * link has its own independent BA scoreboard (mt76_wcid.ampdu_state/
+	 * aggr[]); moving one TID's stream between links mid-session splits
+	 * that single sequence space across two independent scoreboards and
+	 * stalls it. So a TID is assigned a link once and kept there for the
+	 * life of its BA session, not re-picked per packet.
+	 * mlo_tid_link_valid[tid] false means "unmapped, pick one now".
+	 */
+	u8 mlo_tid_link[IEEE80211_NUM_TIDS];
+	bool mlo_tid_link_valid[IEEE80211_NUM_TIDS];
+
+	/* Restored (2026-08-23): jiffies timestamp of the last "STA_REC
+	 * published" event (mt7925_mac_link_sta_add() completing its MCU
+	 * calls) per link. 0 means never published. Used to compute
+	 * link_ready_state for MLO_TX_SELECT tracing and to gate
+	 * mt7925_mlo_force_bulk_wcid()'s use of a link -- this measures
+	 * driver/firmware-local readiness only, not AP-side link activation.
+	 */
+	unsigned long mlo_link_ready_jiffies[IEEE80211_MLD_MAX_NUM_LINKS];
 };
 
 DECLARE_EWMA(rssi, 10, 8);
@@ -160,7 +196,41 @@ struct mt792x_vif {
 
 	struct work_struct csa_work;
 	struct timer_list csa_timer;
+
+	/* mt7925 MLO auto link-steering (see mt7925_mlo_steer_work()). The
+	 * firmware RSSI-monitor event carries no link/bss identifier, so
+	 * only one link can be armed at a time; mt7925_mlo_rotate_rssi_monitor()
+	 * cycles the monitor through every valid link each steering tick, so
+	 * each link's entry here is only refreshed roughly once per (tick
+	 * interval * number of valid links). MT792X_MLO_RSSI_UNKNOWN marks a
+	 * link that has never been sampled yet.
+	 */
+	s8 mlo_link_rssi[IEEE80211_MLD_MAX_NUM_LINKS];
+	unsigned long mlo_link_rssi_jiffies[IEEE80211_MLD_MAX_NUM_LINKS];
+	bool mlo_auto_steering;
+	bool mlo_rssi_monitor_enabled;
+	/* Link the firmware RSSI monitor is currently armed against. The
+	 * monitor event carries no bss/link identifier, so only one link
+	 * can ever be monitored at a time; mt7925_mlo_steer_work() rotates
+	 * this through every valid link each tick. Since the driver itself
+	 * commands which link is armed, attributing the next event to this
+	 * value is unambiguous even without a bss_idx in the event.
+	 */
+	u8 mlo_rssi_monitor_link_id;
+
+	/* Copy of what mt7925_mcu_sta_eht_mld_tlv() (mcu.c) last put into the
+	 * outgoing STA_REC_EHT_MLD TLV's str_cap[]/eml_cap[] -- those bytes
+	 * only ever live in a transient skb freed right after the MCU send,
+	 * so debugfs (mlo_str_cap) needs its own copy to read back.
+	 */
+	u8 mlo_adv_str_cap[3];
+	u8 mlo_adv_eml_cap[3];
+	bool mlo_adv_is_str;
+	unsigned long mlo_last_switch_jiffies;
+	struct delayed_work mlo_steer_work;
 };
+
+#define MT792X_MLO_RSSI_UNKNOWN		S8_MIN
 
 struct mt792x_phy {
 	struct mt76_phy *mt76;
@@ -197,7 +267,14 @@ struct mt792x_phy {
 	struct timer_list roc_timer;
 	wait_queue_head_t roc_wait;
 	u8 roc_token_id;
+	u8 mlo_roc_token_id;
 	bool roc_grant;
+	/* Links held by an outstanding multi-link (JOIN) ROC. The firmware
+	 * keeps a ROC reservation per affiliated link, so every one of them
+	 * has to be released again or it will silently refuse the next
+	 * multi-link ROC request.
+	 */
+	u16 roc_mlo_links;
 };
 
 struct mt792x_irq_map {
@@ -263,6 +340,7 @@ struct mt792x_dev {
 	struct mt792x_phy phy;
 
 	struct work_struct reset_work;
+	u32 reset_gen; /* MLO_RESET debug: distinguishes stale/reused dev memory */
 	bool hw_full_reset:1;
 	bool hw_init_done:1;
 	bool fw_assert:1;
@@ -322,15 +400,55 @@ static inline struct mt792x_link_sta *
 mt792x_sta_to_link(struct mt792x_sta *msta, u8 link_id)
 {
 	struct ieee80211_vif *vif;
+	struct mt792x_link_sta *mlink;
 
 	vif = container_of((void *)msta->vif, struct ieee80211_vif, drv_priv);
 
-	if (!ieee80211_vif_is_mld(vif) ||
-	    link_id >= IEEE80211_LINK_UNSPECIFIED)
+	if (!ieee80211_vif_is_mld(vif))
 		return &msta->deflink;
 
-	return rcu_dereference_protected(msta->link[link_id],
-		lockdep_is_held(&msta->vif->phy->dev->mt76.mutex));
+	if (link_id < IEEE80211_LINK_UNSPECIFIED)
+		return rcu_dereference_protected(msta->link[link_id],
+			lockdep_is_held(&msta->vif->phy->dev->mt76.mutex));
+
+	/* link_id == IEEE80211_LINK_UNSPECIFIED: mac80211 leaves normal MLD
+	 * unicast TX unassigned (net/mac80211/tx.c, "address from the MLD"
+	 * case) rather than picking a link itself -- previously this always
+	 * fell through to msta->deflink. Round-robin across vif->active_links
+	 * instead, so traffic actually distributes across active links. The
+	 * mlo_force_tx_link debugfs override (mt792x_tx(), mt792x_core.c)
+	 * runs after this and takes priority when set.
+	 */
+	{
+		unsigned long active = vif->active_links;
+		u8 next = msta->mlo_tx_link_cursor;
+		int tries;
+
+		if (hweight16(active) <= 1) {
+			mlink = &msta->deflink;
+			goto trace;
+		}
+
+		for (tries = 0; tries < IEEE80211_MLD_MAX_NUM_LINKS; tries++) {
+			next = (next + 1) % IEEE80211_MLD_MAX_NUM_LINKS;
+			if (active & BIT(next))
+				break;
+		}
+		msta->mlo_tx_link_cursor = next;
+
+		mlink = rcu_dereference_protected(msta->link[next],
+			lockdep_is_held(&msta->vif->phy->dev->mt76.mutex));
+		if (!mlink)
+			mlink = &msta->deflink;
+
+trace:
+		if (READ_ONCE(mt76_mlo_diag_trace))
+			printk(KERN_INFO
+			      "MLO_TX_SELECT: requested=unspecified active_links=0x%lx selected_link=%d\n",
+			      active, mlink->wcid.link_id);
+	}
+
+	return mlink;
 }
 
 static inline struct mt792x_bss_conf *
@@ -416,6 +534,16 @@ struct mt76_wcid *mt792x_rx_get_wcid(struct mt792x_dev *dev, u16 idx,
 void mt792x_mac_update_mib_stats(struct mt792x_phy *phy);
 void mt792x_mac_set_timeing(struct mt792x_phy *phy);
 void mt792x_mac_work(struct work_struct *work);
+void mt7925_mlo_sample_load(struct mt792x_dev *dev);
+u32 mt7925_mlo_dbg_elapsed(u8 link_id);
+u32 mt7925_mlo_dbg_raw_util(u8 link_id);
+u32 mt7925_mlo_dbg_util(u8 link_id);
+u32 mt7925_mlo_dbg_delta(u8 link_id);
+u32 mt7925_mlo_dbg_spare(u8 link_id);
+u32 mt7925_mlo_dbg_weight(u8 link_id);
+u64 mt7925_mlo_dbg_placements(u8 link_id);
+u64 mt7925_mlo_dbg_cache_hits(u8 link_id);
+void mt7925_mlo_clear_tid_link(struct mt792x_sta *msta, int tid);
 void mt792x_remove_interface(struct ieee80211_hw *hw,
 			     struct ieee80211_vif *vif);
 void mt792x_tx(struct ieee80211_hw *hw, struct ieee80211_tx_control *control,
