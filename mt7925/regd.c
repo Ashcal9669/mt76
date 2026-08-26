@@ -9,6 +9,17 @@ static bool mt7925_disable_clc;
 module_param_named(disable_clc, mt7925_disable_clc, bool, 0644);
 MODULE_PARM_DESC(disable_clc, "disable CLC support");
 
+/*
+ * TEST-ONLY: permit controlled MT7927E MLO testing on platforms whose ACPI
+ * MTCL table has no MT7927-specific BE authorization. This does not replace
+ * the required platform/BIOS correction and must remain disabled normally.
+ */
+static bool mt7925_test_mt7927_eht_override;
+module_param_named(test_mt7927_eht_override,
+		   mt7925_test_mt7927_eht_override, bool, 0644);
+MODULE_PARM_DESC(test_mt7927_eht_override,
+		 "TEST-ONLY: override MT7927E EHT capability gate");
+
 static struct ieee80211_regdomain mt7925_regd_ww = {
 	.n_reg_rules = 1,
 	.alpha2 =  "00",
@@ -65,6 +76,15 @@ void mt7925_regd_be_ctrl(struct mt792x_dev *dev, u8 *alpha2)
 	}
 
 out:
+	if (mt7925_test_mt7927_eht_override && is_mt7927(&dev->mt76)) {
+		dev_warn(dev->mt76.dev,
+			 "TEST-ONLY MT7927E EHT capability override enabled: ignoring MTCL/CLC EHT disable result\n");
+		new = true;
+	}
+
+	dev_info(dev->mt76.dev,
+		 "MLO_EHT_CAP_TRACE: be_ctrl result old_has_eht=%d new_has_eht=%d changed=%d\n",
+		 old, new, old != new);
 	if (old == new)
 		return;
 
