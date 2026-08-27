@@ -1518,6 +1518,21 @@ int mt7925_mcu_set_mlo_roc(struct mt792x_phy *phy, struct mt792x_bss_conf *mconf
 			req.roc[i].sco = 3; /* SCB */
 
 		req.roc[i].band = ch_band[chan->band];
+
+		if (READ_ONCE(mt76_mlo_diag_trace))
+			printk(KERN_INFO "MLO_ROC_ENTRY: idx=%u link_id=%u reqtype=%u bss_idx=%u band=%u control_channel=%u bw=%u center_chan=%u dbdcband=%u token=%u\n",
+			       i, links[i].id, req.roc[i].reqtype,
+			       req.roc[i].bss_idx, req.roc[i].band,
+			       req.roc[i].control_channel, req.roc[i].bw,
+			       req.roc[i].center_chan, req.roc[i].dbdcband,
+			       req.roc[i].tokenid);
+	}
+
+	if (READ_ONCE(mt76_mlo_diag_trace)) {
+		printk(KERN_INFO "MLO_FW_ROC_RAW: cmd=0x%x sel_links=0x%x len=%zu\n",
+		       (unsigned int)MCU_UNI_CMD(ROC), sel_links, sizeof(req));
+		print_hex_dump(KERN_INFO, "MLO_FW_ROC_RAW: ", DUMP_PREFIX_OFFSET,
+			       16, 1, &req, sizeof(req), false);
 	}
 
 	return mt76_mcu_send_msg(&mvif->phy->dev->mt76, MCU_UNI_CMD(ROC),
@@ -2087,6 +2102,15 @@ mt7925_mcu_sta_mld_tlv(struct sk_buff *skb,
 	}
 
 	mld->link_num = cnt;
+
+	if (READ_ONCE(mt76_mlo_diag_trace))
+		printk(KERN_INFO
+		       "MLO_FW_STA_MLD: update_link=%u primary=%u secondary=%u wlan=%u link_num=%u l0_wlan=%u l0_bss=%u l1_wlan=%u l1_bss=%u\n",
+		       mconf->link_id, le16_to_cpu(mld->primary_id),
+		       le16_to_cpu(mld->secondary_id), le16_to_cpu(mld->wlan_id),
+		       mld->link_num, le16_to_cpu(mld->link[0].wlan_id),
+		       mld->link[0].bss_idx, le16_to_cpu(mld->link[1].wlan_id),
+		       mld->link[1].bss_idx);
 }
 
 static void
@@ -2158,6 +2182,16 @@ mt7925_mcu_sta_cmd(struct mt76_phy *phy,
 			mlink = &mvif->sta.deflink;
 
 		mt7925_mcu_sta_hdr_trans_tlv(skb, info->vif, mlink);
+	}
+
+	if (READ_ONCE(mt76_mlo_diag_trace) && ieee80211_vif_is_mld(info->vif)) {
+		printk(KERN_INFO
+		       "MLO_FW_STA_RAW: cmd=0x%x link_id=%u bss_idx=%u wcid=%u enable=%u state=%u newly=%u len=%u\n",
+		       info->cmd, info->wcid->link_id, mconf->mt76.idx,
+		       info->wcid->idx, info->enable, info->state, info->newly,
+		       skb->len);
+		print_hex_dump(KERN_INFO, "MLO_FW_STA_RAW: ", DUMP_PREFIX_OFFSET,
+			       16, 1, skb->data, skb->len, false);
 	}
 
 	return mt76_mcu_skb_send_msg(dev, skb, info->cmd, true);
@@ -2813,6 +2847,13 @@ mt7925_mcu_bss_mld_tlv(struct sk_buff *skb,
 			     IEEE80211_EML_CAP_EMLSR_SUPP);
 
 	memcpy(mld->mac_addr, vif->addr, ETH_ALEN);
+
+	if (READ_ONCE(mt76_mlo_diag_trace))
+		printk(KERN_INFO
+		       "MLO_FW_BSS_MLD: link_id=%u bss_idx=%u group_mld=%u own_mld=%u remap=%u eml=%u mac=%pM\n",
+		       mld->link_id, mconf->mt76.idx, mld->group_mld_id,
+		       mld->own_mld_id, mld->remap_idx, mld->eml_enable,
+		       mld->mac_addr);
 }
 
 static void
@@ -3015,6 +3056,17 @@ int mt7925_mcu_add_bss_info_sta(struct mt792x_phy *phy,
 	if (enable) {
 		mt7925_mcu_bss_rlm_tlv(skb, phy->mt76, link_conf, ctx);
 		mt7925_mcu_bss_mbssid_tlv(skb, link_conf, enable);
+	}
+
+	if (READ_ONCE(mt76_mlo_diag_trace) && ieee80211_vif_is_mld(link_conf->vif)) {
+		printk(KERN_INFO
+		       "MLO_FW_BSS_RAW: cmd=0x%x link_id=%u bss_idx=%u band_idx=%u omac_idx=%u wmm_idx=%u sta_wlan=%u bmc_wlan=%u enable=%u len=%u\n",
+		       (unsigned int)MCU_UNI_CMD(BSS_INFO_UPDATE), link_conf->link_id,
+		       mconf->mt76.idx, mconf->mt76.band_idx,
+		       mconf->mt76.omac_idx, mconf->mt76.wmm_idx,
+		       sta_wlan_idx, bmc_tx_wlan_idx, enable, skb->len);
+		print_hex_dump(KERN_INFO, "MLO_FW_BSS_RAW: ", DUMP_PREFIX_OFFSET,
+			       16, 1, skb->data, skb->len, false);
 	}
 
 	err = mt76_mcu_skb_send_msg(&dev->mt76, skb,
