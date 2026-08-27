@@ -1710,6 +1710,15 @@ int mt7925_mac_sta_add(struct mt76_dev *mdev, struct ieee80211_vif *vif,
 }
 EXPORT_SYMBOL_GPL(mt7925_mac_sta_add);
 
+/* TEST-ONLY: deterministically choose an already-usable MT7927 MLO pair
+ * before link activation. Zero preserves the automatic selector.
+ */
+static u8 mt7925_test_mlo_pair_mask;
+module_param_named(test_mt7927_mlo_pair_mask, mt7925_test_mlo_pair_mask,
+		   byte, 0644);
+MODULE_PARM_DESC(test_mt7927_mlo_pair_mask,
+		 "TEST-ONLY MT7927 pre-activation MLO pair mask (0, 0x3, 0x5, or 0x6)");
+
 static void
 mt7925_mac_set_links(struct mt76_dev *mdev, struct ieee80211_vif *vif)
 {
@@ -1719,12 +1728,36 @@ mt7925_mac_set_links(struct mt76_dev *mdev, struct ieee80211_vif *vif)
 		mt792x_vif_to_bss_conf(vif, mvif->deflink_id);
 	struct cfg80211_chan_def *chandef = &link_conf->chanreq.oper;
 	enum nl80211_band band = chandef->chan->band, secondary_band;
-
 	u16 sel_links = mt76_select_links(vif, 2);
-	u8 secondary_link_id = __ffs(~BIT(mvif->deflink_id) & sel_links);
+	u16 test_pair = READ_ONCE(mt7925_test_mlo_pair_mask);
+	unsigned long usable_links = ieee80211_vif_usable_links(vif);
+	u8 secondary_link_id;
+
+	if (test_pair && is_mt7927(mdev)) {
+		if (test_pair != 0x3 && test_pair != 0x5 && test_pair != 0x6) {
+			dev_warn(dev->mt76.dev,
+				 "MLO_LINK_SELECT: TEST-ONLY MT7927 pair 0x%x invalid; automatic pair remains 0x%x\n",
+				 test_pair, sel_links);
+		} else if ((test_pair & usable_links) != test_pair) {
+			dev_warn(dev->mt76.dev,
+				 "MLO_LINK_SELECT: TEST-ONLY MT7927 pair 0x%x not usable (candidates=0x%lx); automatic pair remains 0x%x\n",
+				 test_pair, usable_links, sel_links);
+		} else if (!(test_pair & BIT(mvif->deflink_id))) {
+			dev_warn(dev->mt76.dev,
+				 "MLO_LINK_SELECT: TEST-ONLY MT7927 pair 0x%x excludes active anchor link%u; automatic pair remains 0x%x\n",
+				 test_pair, mvif->deflink_id, sel_links);
+		} else {
+			sel_links = test_pair;
+			dev_warn(dev->mt76.dev,
+				 "MLO_LINK_SELECT: TEST-ONLY MT7927 EHT/MLO pair override selected pair=0x%x anchor=link%u candidates=0x%lx\n",
+				 sel_links, mvif->deflink_id, usable_links);
+		}
+	}
 
 	if (!ieee80211_vif_is_mld(vif) || hweight16(sel_links) < 2)
 		return;
+
+	secondary_link_id = __ffs(~BIT(mvif->deflink_id) & sel_links);
 
 	link_conf = mt792x_vif_to_bss_conf(vif, secondary_link_id);
 	secondary_band = link_conf->chanreq.oper.chan->band;
