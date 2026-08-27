@@ -5,6 +5,7 @@
 #include "../dma.h"
 #include "mcu.h"
 #include "mac.h"
+#include "../trace.h"
 
 int mt7925e_tx_prepare_skb(struct mt76_dev *mdev, void *txwi_ptr,
 			   enum mt76_txq_id qid, struct mt76_wcid *wcid,
@@ -42,12 +43,72 @@ int mt7925e_tx_prepare_skb(struct mt76_dev *mdev, void *txwi_ptr,
 	}
 
 	pid = mt76_tx_status_skb_add(mdev, wcid, tx_info->skb);
+	t->mlo_diag_eapol = unlikely(mt76_mlo_diag_trace) &&
+			    tx_info->skb->protocol == cpu_to_be16(ETH_P_PAE);
+	t->mlo_diag_token = id;
+	t->mlo_diag_pid = pid;
 	mt7925_mac_write_txwi(mdev, txwi_ptr, tx_info->skb, wcid, key,
 			      pid, qid, 0);
+	if (unlikely(mt76_mlo_diag_trace)) {
+		struct mt792x_bss_conf *mconf = NULL;
+		struct mt76_phy *dma_phy = mt76_dev_phy(mdev, t->phy_idx);
+		struct mt76_queue *q = dma_phy ? dma_phy->q_tx[t->qid] : NULL;
+		struct mt792x_link_sta *mlink;
+		struct mt76_mlo_txwi_trace v = {};
+		int mconf_link = -1, bss = -1, wmm = -1;
+		u32 txd0 = le32_to_cpu(((__le32 *)txwi_ptr)[0]);
+		u32 txd1 = le32_to_cpu(((__le32 *)txwi_ptr)[1]);
+		u32 txd3 = le32_to_cpu(((__le32 *)txwi_ptr)[3]);
+
+		if (wcid->sta) {
+			mlink = container_of(wcid, struct mt792x_link_sta, wcid);
+			if (mlink->sta && mlink->sta->vif) {
+				rcu_read_lock();
+				mconf = rcu_dereference(mlink->sta->vif->link_conf[wcid->link_id]);
+				if (mconf) {
+					mconf_link = mconf->link_id;
+					bss = mconf->mt76.idx;
+					wmm = mconf->mt76.wmm_idx;
+				}
+				rcu_read_unlock();
+			}
+		}
+		v = (struct mt76_mlo_txwi_trace) {
+			.token = id, .pid = pid, .wcid = wcid->idx,
+			.wlan = FIELD_GET(MT_TXD1_WLAN_IDX, txd1),
+			.wcid_cipher = wcid->cipher,
+			.seq = FIELD_GET(MT_TXD3_SEQ, txd3),
+			.mconf_link = mconf_link, .bss = bss,
+			.omac = FIELD_GET(MT_TXD1_OWN_MAC, txd1), .wmm = wmm,
+			.key_idx = key ? key->keyidx : -1,
+			.hw_key_idx = wcid->hw_key_idx, .ring = q ? q->hw_idx : -1,
+			.key_cipher = key ? key->cipher : 0,
+			.link = wcid->link_id, .sel_phy = wcid->phy_idx,
+			.txd_qidx = FIELD_GET(MT_TXD0_Q_IDX, txd0),
+			.tgid = FIELD_GET(MT_TXD1_TGID, txd1),
+			.tid = FIELD_GET(MT_TXD1_TID, txd1), .qid = qid,
+			.dma_phy = t->phy_idx,
+			.protect = !!(txd3 & MT_TXD3_PROTECT_FRAME),
+			.ba_disable = !!(txd3 & MT_TXD3_BA_DISABLE),
+			.hw_amsdu = !!(txd3 & MT_TXD3_HW_AMSDU),
+			.sn_valid = !!(txd3 & MT_TXD3_SN_VALID),
+		};
+		trace_mlo_txwi(mdev, &v);
+	}
 
 	txp = (struct mt76_connac_hw_txp *)(txwi + MT_TXD_SIZE);
 	memset(txp, 0, sizeof(struct mt76_connac_hw_txp));
 	mt76_connac_write_hw_txp(mdev, tx_info, txp, id);
+
+	if (t->mlo_diag_eapol) {
+		printk(KERN_INFO
+		       "MLO_EAPOL_TXWI_FINAL: token=%d pid=%d wcid=%u qid=%u phy=%u txwi_dma=%pad len=%u\n",
+		       id, pid, wcid->idx, qid, t->phy_idx, &t->dma_addr,
+		       mdev->drv->txwi_size);
+		print_hex_dump(KERN_INFO, "MLO_EAPOL_TXWI_FINAL: ",
+			       DUMP_PREFIX_OFFSET, 16, 1, txwi_ptr,
+			       mdev->drv->txwi_size, false);
+	}
 
 	tx_info->skb = NULL;
 

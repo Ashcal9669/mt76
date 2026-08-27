@@ -9,6 +9,7 @@
 #include "regd.h"
 #include "mac.h"
 #include "mcu.h"
+#include "../trace.h"
 
 bool mt7925_mac_wtbl_update(struct mt792x_dev *dev, int idx, u32 mask)
 {
@@ -943,13 +944,40 @@ mt7925_mac_add_txs_skb(struct mt792x_dev *dev, struct mt76_wcid *wcid,
 	bool cck = false;
 	u32 txrate, txs, mode, stbc;
 
+	txs = le32_to_cpu(txs_data[0]);
+	if (unlikely(mt76_mlo_diag_trace)) {
+		u8 ack_error = FIELD_GET(MT_TXS0_ACK_ERROR_MASK, txs);
+
+		trace_mlo_txs(mdev, wcid->idx, wcid->link_id, pid, ack_error,
+			      !ack_error, FIELD_GET(MT_TXS0_TX_RATE, txs),
+			      FIELD_GET(MT_TXS0_BW, txs));
+	}
+
 	mt76_tx_status_lock(mdev, &list);
 	skb = mt76_tx_status_skb_get(mdev, wcid, pid, &list);
-	if (!skb)
+	if (!skb) {
+		if (unlikely(mt76_mlo_diag_trace))
+			printk(KERN_INFO
+			      "MLO_TXS_NO_SKB: wcid=%u link_id=%u pid=%d ack_error=%u txs_wcid=%u\n",
+			      wcid->idx, wcid->link_id, pid,
+			      (u32)FIELD_GET(MT_TXS0_ACK_ERROR_MASK, txs),
+			      (u32)FIELD_GET(MT_TXS2_WCID, le32_to_cpu(txs_data[2])));
 		goto out_no_skb;
+	}
 
-	txs = le32_to_cpu(txs_data[0]);
 	info = IEEE80211_SKB_CB(skb);
+	if (unlikely(mt76_mlo_diag_trace) &&
+	    (info->control.flags & IEEE80211_TX_CTRL_PORT_CTRL_PROTO))
+		printk(KERN_INFO
+		      "MLO_EAPOL_TXS: wcid=%u link_id=%u pid=%d ack_timeout=%u rts_timeout=%u queue_timeout=%u ba_error=%u txrate_raw=0x%x bw=%u\n",
+		      wcid->idx, wcid->link_id, pid,
+		      !!(txs & MT_TXS0_ACK_TIMEOUT),
+		      !!(txs & MT_TXS0_RTS_TIMEOUT),
+		      !!(txs & MT_TXS0_QUEUE_TIMEOUT),
+		      !!(txs & MT_TXS0_BA_ERROR),
+		      (u32)FIELD_GET(MT_TXS0_TX_RATE, txs),
+		      (u32)FIELD_GET(MT_TXS0_BW, txs));
+
 	if (!(txs & MT_TXS0_ACK_ERROR_MASK))
 		info->flags |= IEEE80211_TX_STAT_ACK;
 
@@ -1254,6 +1282,13 @@ void mt7925_mac_add_txs(struct mt792x_dev *dev, void *data)
 	wcidx = le32_get_bits(txs_data[2], MT_TXS2_WCID);
 	pid = le32_get_bits(txs_data[3], MT_TXS3_PID);
 
+	if (unlikely(mt76_mlo_diag_trace) && pid == 3 && wcidx == 1) {
+		printk(KERN_INFO "MLO_EAPOL_RAWS_TXS: wcid=%u pid=%u\n",
+		       wcidx, pid);
+		print_hex_dump(KERN_INFO, "MLO_EAPOL_RAWS_TXS: ",
+			       DUMP_PREFIX_OFFSET, 16, 1, data, 32, false);
+	}
+
 	if (pid < MT_PACKET_ID_FIRST)
 		return;
 
@@ -1319,6 +1354,7 @@ mt7925_mac_tx_free(struct mt792x_dev *dev, void *data, int len)
 	struct sk_buff *skb, *tmp;
 	void *end = data + len;
 	bool wake = false;
+	u8 attempts = 0, tx_status = 0;
 	u16 total, count = 0;
 
 	/* clean DMA queues and unmap buffers first */
@@ -1355,8 +1391,10 @@ mt7925_mac_tx_free(struct mt792x_dev *dev, void *data, int len)
 		}
 
 		if (info & MT_TXFREE_INFO_HEADER) {
+			attempts = FIELD_GET(MT_TXFREE_INFO_COUNT, info);
+			tx_status = FIELD_GET(MT_TXFREE_INFO_STAT, info);
 			if (wcid) {
-				u32 count = FIELD_GET(MT_TXFREE_INFO_COUNT, info);
+				u32 count = attempts;
 
 				wcid->stats.tx_retries += count ? count - 1 : 0;
 				wcid->stats.tx_failed +=
@@ -1371,9 +1409,18 @@ mt7925_mac_tx_free(struct mt792x_dev *dev, void *data, int len)
 				continue;
 
 			count++;
+			if (unlikely(mt76_mlo_diag_trace) && msdu == 0)
+				printk(KERN_INFO
+				       "MLO_EAPOL_RAWS_TXFREE: token=0 wcid=%u attempts=%u status=%u raw_info=0x%08x\n",
+				       wcid ? wcid->idx : 0xffff, attempts,
+				       tx_status, info);
 			txwi = mt76_token_release(mdev, msdu, &wake);
 			if (!txwi)
 				continue;
+			if (unlikely(mt76_mlo_diag_trace) && wcid)
+				trace_mlo_txfree(mdev, wcid->idx, wcid->link_id,
+						 msdu, attempts, tx_status,
+						 !!tx_status);
 
 			mt7925_txwi_free(dev, txwi, sta, wcid, &free_list);
 		}
@@ -1392,6 +1439,35 @@ mt7925_mac_tx_free(struct mt792x_dev *dev, void *data, int len)
 	}
 }
 
+static bool mt7925_mlo_eapol_token_pending(struct mt76_dev *mdev)
+{
+	struct mt76_txwi_cache *txwi;
+	bool pending;
+
+	spin_lock_bh(&mdev->token_lock);
+	txwi = idr_find(&mdev->token, 0);
+	pending = txwi && txwi->mlo_diag_eapol;
+	spin_unlock_bh(&mdev->token_lock);
+
+	return pending;
+}
+
+static void mt7925_mlo_raw_completion(struct mt792x_dev *dev,
+				      enum rx_pkt_type type,
+				      const void *data, int len)
+{
+	if (!unlikely(mt76_mlo_diag_trace) ||
+	    !mt7925_mlo_eapol_token_pending(&dev->mt76) ||
+	    (type != PKT_TYPE_TXRX_NOTIFY && type != PKT_TYPE_TXS))
+		return;
+
+	printk(KERN_INFO "MLO_EAPOL_RAW_RX_BOUNDARY: token=0 type=%u len=%d\n",
+	       type, len);
+	print_hex_dump(KERN_INFO, "MLO_EAPOL_RAW_RX_BOUNDARY: ",
+		       DUMP_PREFIX_OFFSET, 16, 1, data, min_t(int, len, 64),
+		       false);
+}
+
 bool mt7925_rx_check(struct mt76_dev *mdev, void *data, int len)
 {
 	struct mt792x_dev *dev = container_of(mdev, struct mt792x_dev, mt76);
@@ -1400,6 +1476,7 @@ bool mt7925_rx_check(struct mt76_dev *mdev, void *data, int len)
 	enum rx_pkt_type type;
 
 	type = le32_get_bits(rxd[0], MT_RXD0_PKT_TYPE);
+	mt7925_mlo_raw_completion(dev, type, data, len);
 	if (type != PKT_TYPE_NORMAL) {
 		u32 sw_type = le32_get_bits(rxd[0], MT_RXD0_SW_PKT_TYPE_MASK);
 
@@ -1434,6 +1511,7 @@ void mt7925_queue_rx_skb(struct mt76_dev *mdev, enum mt76_rxq_id q,
 	u16 flag;
 
 	type = le32_get_bits(rxd[0], MT_RXD0_PKT_TYPE);
+	mt7925_mlo_raw_completion(dev, type, skb->data, skb->len);
 	flag = le32_get_bits(rxd[0], MT_RXD0_PKT_FLAG);
 	if (type != PKT_TYPE_NORMAL) {
 		u32 sw_type = le32_get_bits(rxd[0], MT_RXD0_SW_PKT_TYPE_MASK);

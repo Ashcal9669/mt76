@@ -4,6 +4,19 @@
  */
 
 #include "mt76.h"
+#include "trace.h"
+
+/* EXPERIMENTAL: see declaration in mt76.h. */
+struct mt76_wcid *(*mt76_experimental_mlo_wcid_hook)(struct mt76_wcid *wcid,
+						      struct ieee80211_sta *sta,
+						      struct sk_buff *skb);
+EXPORT_SYMBOL_GPL(mt76_experimental_mlo_wcid_hook);
+
+/* Temporary, evidence-only MLO descriptor tracing. Disabled by default and
+ * controlled through mt7925 debugfs mlo_diag_trace.
+ */
+bool mt76_mlo_diag_trace;
+EXPORT_SYMBOL_GPL(mt76_mlo_diag_trace);
 
 static int
 mt76_txq_get_qid(struct ieee80211_txq *txq)

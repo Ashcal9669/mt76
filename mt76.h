@@ -466,6 +466,27 @@ struct mt76_txwi_cache {
 
 	u8 qid;
 	u8 phy_idx;
+	/* TEST-ONLY diagnostics: populated only for traced EAPOL frames. */
+	u16 mlo_diag_token;
+	u16 mlo_diag_pid;
+	bool mlo_diag_eapol;
+};
+
+struct mt76_mlo_tx_select_trace {
+	u32 hash;
+	u16 protocol, orig_wcid, sel_wcid;
+	u8 path, priority, txq_tid, qid;
+	u8 orig_link, orig_phy, sel_link, sel_phy, info_link;
+	u8 da[ETH_ALEN];
+	bool l4_hash, sw_hash, aggr, sta_present, vif_present;
+};
+
+struct mt76_mlo_txwi_trace {
+	u32 key_cipher;
+	u16 token, pid, wcid, wlan, wcid_cipher, seq;
+	s16 mconf_link, bss, omac, wmm, key_idx, hw_key_idx, ring;
+	u8 link, sel_phy, txd_qidx, tgid, tid, qid, dma_phy;
+	bool protect, ba_disable, hw_amsdu, sn_valid;
 };
 
 struct mt76_rx_tid {
@@ -1320,6 +1341,22 @@ __mt76_wcid_ptr(struct mt76_dev *dev, u16 idx)
 }
 
 #define mt76_wcid_ptr(dev, idx) __mt76_wcid_ptr(&(dev)->mt76, idx)
+
+/* EXPERIMENTAL: bulk-TXQ MLO link override hook. mt76_txq_schedule_list()
+ * (tx.c) normally uses whatever wcid was cached on the mac80211 txq at
+ * queue-creation time (mtxq->wcid, set once, never re-resolved). If this
+ * is non-NULL, it is called with that resolved wcid right before use; a
+ * non-NULL return replaces it for this dequeue only. Chip-specific driver
+ * (mt792x_core.c) sets this; core mt76 stays chip-agnostic and simply
+ * defers to it. Default NULL (no-op, existing behavior unchanged).
+ */
+extern struct mt76_wcid *(*mt76_experimental_mlo_wcid_hook)(struct mt76_wcid *wcid,
+							     struct ieee80211_sta *sta,
+						      struct sk_buff *skb);
+extern bool mt76_mlo_diag_trace;
+extern u8 mt76_mlo_bssadd_skip;
+extern u32 mt76_mlo_bssadd_delay_ms;
+void mt76_mlo_bssinfo_deferred_send(void);
 
 struct mt76_dev *mt76_alloc_device(struct device *pdev, unsigned int size,
 				   const struct ieee80211_ops *ops,
