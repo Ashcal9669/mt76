@@ -22,12 +22,6 @@ module_param_named(test_mt7927_mlo_pair_mask, mt7925_test_mlo_pair_mask,
 MODULE_PARM_DESC(test_mt7927_mlo_pair_mask,
 		 "TEST-ONLY MT7927 pre-activation MLO pair mask (0, 0x3, 0x5, or 0x6)");
 
-static bool mt7925_test_mt7927_5g6g_sec_band0;
-module_param_named(test_mt7927_5g6g_sec_band0,
-		   mt7925_test_mt7927_5g6g_sec_band0, bool, 0644);
-MODULE_PARM_DESC(test_mt7927_5g6g_sec_band0,
-		 "TEST-ONLY MT7927 forced-0x6 secondary link1 BSS band_idx=0 causality experiment");
-
 static void
 mt7925_init_he_caps(struct mt792x_phy *phy, enum nl80211_band band,
 		    struct ieee80211_sband_iftype_data *data,
@@ -418,6 +412,46 @@ static int mt7925_start(struct ieee80211_hw *hw)
 	return err;
 }
 
+static void mt7927_mld_assign_band_idx(struct mt792x_dev *dev,
+				       struct ieee80211_bss_conf *link_conf,
+				       struct mt792x_bss_conf *mconf,
+				       struct ieee80211_channel *chan)
+{
+	struct ieee80211_vif *vif = link_conf->vif;
+	struct mt792x_vif *mvif = mconf->vif;
+	u8 band_idx = mt7927_band_idx(chan->band);
+	u8 link_id;
+
+	mconf->mt76.band_idx = band_idx;
+
+	if (!is_mt7927(&dev->mt76) ||
+	    !ieee80211_vif_is_mld(vif) ||
+	    vif->type != NL80211_IFTYPE_STATION)
+		return;
+
+	for (link_id = 0; link_id < IEEE80211_MLD_MAX_NUM_LINKS; link_id++) {
+		struct mt792x_bss_conf *other;
+
+		if (link_id == link_conf->link_id)
+			continue;
+
+		other = rcu_dereference_protected(mvif->link_conf[link_id],
+						  lockdep_is_held(&dev->mt76.mutex));
+		if (!other || other == mconf ||
+		    other->mt76.band_idx == 0xff ||
+		    other->mt76.band_idx != band_idx)
+			continue;
+
+		mconf->mt76.band_idx = band_idx ^ 1;
+		dev_info(dev->mt76.dev,
+			 "MT7927 MLO BSS band context collision: link_id=%u bss_idx=%u band=%d orig=%u resident_link=%u resident_bss=%u new=%u\n",
+			 link_conf->link_id, mconf->mt76.idx, chan->band,
+			 band_idx, link_id, other->mt76.idx,
+			 mconf->mt76.band_idx);
+		return;
+	}
+}
+
 static int mt7925_mac_link_bss_add(struct mt792x_dev *dev,
 				   struct ieee80211_bss_conf *link_conf,
 				   struct mt792x_link_sta *mlink)
@@ -451,22 +485,7 @@ static int mt7925_mac_link_bss_add(struct mt792x_dev *dev,
 		else
 			chan = mvif->phy->mt76->chandef.chan;
 
-		mconf->mt76.band_idx = mt7927_band_idx(chan->band);
-		if (READ_ONCE(mt7925_test_mt7927_5g6g_sec_band0) &&
-		    READ_ONCE(mt7925_test_mlo_pair_mask) == 0x6 &&
-		    ieee80211_vif_is_mld(vif) &&
-		    vif->type == NL80211_IFTYPE_STATION &&
-		    link_conf->link_id == 1 &&
-		    mvif->deflink_id != link_conf->link_id &&
-		    chan->band == NL80211_BAND_5GHZ) {
-			u8 orig_band_idx = mconf->mt76.band_idx;
-
-			mconf->mt76.band_idx = 0;
-			printk(KERN_WARNING
-			       "TEST-ONLY MT7927 5+6 secondary BSS band_idx override: pair=0x6 link_id=%u bss_idx=%u orig=%u new=%u\n",
-			       link_conf->link_id, mconf->mt76.idx,
-			       orig_band_idx, mconf->mt76.band_idx);
-		}
+		mt7927_mld_assign_band_idx(dev, link_conf, mconf, chan);
 	}
 
 	mconf->mt76.wmm_idx = ieee80211_vif_is_mld(vif) ?
